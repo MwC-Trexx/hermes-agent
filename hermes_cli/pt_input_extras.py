@@ -2,11 +2,108 @@
 
 from __future__ import annotations
 
+import os
+
 # kitty CSI-u ORs lock-key state into the modifier parameter of every key event while a lock is
 # on: CapsLock=64, NumLock=128, both=192. Every fixed-modifier CSI-u (and legacy CSI-tilde /
 # CSI-letter) registration therefore needs lock-offset twins, or those events leak into the prompt
 # as literal text. The xterm modifyOtherKeys ``ESC[27;N;CP~`` encoding never carries lock bits.
 # See #88221, #89651.
+
+
+# US-layout Shift+punctuation pairs, as posted by @thinkyhead on PR #94385
+# (2026-08-27) and carried over from there. This is the map the base-codepoint
+# half translates through, and it is the only part of the Shift+punctuation
+# work that main does not already cover: main maps the *tilde* (produced
+# codepoint) form for all of 33..126, which is layout-safe by construction.
+# Keys are the UNSHIFTED codepoints; values are what the key produces on a US
+# layout. Only safe to apply where the layout is positively known to be US --
+# see `_shift_punctuation_base_map_is_safe`.
+_SHIFT_PUNCTUATION_BASE_CP: dict[int, str] = {
+    ord("1"): "!", ord("2"): "@", ord("3"): "#", ord("4"): "$",
+    ord("5"): "%", ord("6"): "^", ord("7"): "&", ord("8"): "*",
+    ord("9"): "(", ord("0"): ")", ord("-"): "_", ord("="): "+",
+    ord("["): "{", ord("]"): "}", ord("\\"): "|", ord(";"): ":",
+    ord("'"): '"', ord(","): "<", ord("."): ">", ord("/"): "?",
+    ord("`"): "~",
+}
+
+
+def _kitty_reports_unshifted_codepoints() -> bool:
+    """True when the CSI-u path will be driven with UNSHIFTED codepoints.
+
+    The kitty keyboard protocol always reports the base (unshifted) codepoint
+    plus a Shift modifier, while xterm modifyOtherKeys emitters report the
+    already-shifted one.  That single difference decides which half of the
+    Shift+punctuation table can ever fire, and therefore whether a US-layout
+    assumption is load-bearing — see ``_shift_punctuation_base_map_is_safe``.
+
+    Ghostty is excluded deliberately: it is pushed modifyOtherKeys only (its
+    kitty disambiguate mode strips Alt from Backspace), so it reports shifted
+    codepoints even though its TERM mentions neither protocol.
+    """
+    env = os.environ
+    if (env.get("TERM_PROGRAM") or "").strip() == "ghostty":
+        return False
+    term = (env.get("TERM") or "").strip().lower()
+    if term == "xterm-ghostty":
+        return False
+    return bool(env.get("KITTY_WINDOW_ID") or "kitty" in term)
+
+
+def _us_punctuation_layout() -> bool:
+    """True only when Shift+<punct> is POSITIVELY known to follow US layout.
+
+    Cheap and env/file based on purpose: this runs on the CLI startup path, so
+    it must not spawn a subprocess.  Unknown answers return False, because the
+    caller treats False as "do not guess".
+    """
+    layout = (os.environ.get("XKB_DEFAULT_LAYOUT") or "").strip().lower()
+    if not layout:
+        for path, key in (
+            ("/etc/default/keyboard", "XKBLAYOUT"),
+            ("/etc/vconsole.conf", "KEYMAP"),
+        ):
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    for line in handle:
+                        name, _, value = line.partition("=")
+                        if name.strip() == key:
+                            layout = value.strip().strip('"').strip("'").lower()
+                            break
+            except OSError:
+                continue
+            if layout:
+                break
+    if not layout:
+        return False
+    # "us", "us,gr" (us primary), "us-acentos"/"us.utf-8" console keymaps.
+    primary = layout.split(",")[0].strip()
+    return primary == "us" or primary.startswith(("us-", "us."))
+
+
+def _shift_punctuation_base_map_is_safe() -> bool:
+    """Whether the base-codepoint half of the Shift+punctuation map may install.
+
+    The map has two halves and they are NOT equally safe:
+
+    * ``punct_map[ord(shifted)] = shifted`` is an IDENTITY mapping — whatever
+      shifted codepoint the terminal reports is echoed back.  Correct on every
+      keyboard layout, so it installs unconditionally.
+    * ``punct_map[base_cp] = shifted`` translates ``2`` into ``@`` from a US
+      table.  It is a guess, and on a non-US layout it types the WRONG
+      character rather than leaking an escape sequence.
+
+    Which half fires is decided entirely by the terminal, and only kitty
+    reaches the guessing half — so a kitty user on a Greek/AZERTY/German
+    keyboard is the one who would eat wrong input.  The original Shift+letter
+    patch refused symbols for exactly this reason ("they will leak, but that's
+    better than wrong input"); leaking is still the better failure, so the
+    guess installs only where it cannot be wrong.
+    """
+    return not _kitty_reports_unshifted_codepoints() or _us_punctuation_layout()
+
+
 _LOCK_BIT_OFFSETS = (0, 64, 128, 192)
 
 
@@ -258,6 +355,22 @@ def _modify_other_keys_aliases(ANSI_SEQUENCES: dict, Keys) -> dict[str, object]:
     for cp in range(33, 127):
         for modifier in (2, 9, 10):
             _put(f"\x1b[27;{modifier};{cp}~", chr(cp))
+
+    # -- Shift+punctuation, base-codepoint half (the only half the loop above
+    # does not already cover). The tilde form maps the PRODUCED character, so
+    # it is layout-safe by construction. Kitty's CSI-u form instead reports the
+    # UNSHIFTED codepoint, so kitty is the only terminal that can reach a
+    # base->shifted translation, and that translation is a guess: on a non-US
+    # layout it types the WRONG character rather than leaking an escape
+    # sequence. The original Shift+letter patch refused symbols for exactly
+    # this reason ("they will leak, but that's better than wrong input"), and
+    # leaking is still the better failure — so the guess installs only where it
+    # cannot be wrong. Unknown answers return False, and False means do not
+    # guess. The base half is registered CSI-u ONLY: the tilde spelling of a
+    # base codepoint is not something a layout-resolving emitter sends, and
+    # re-adding it here would shadow the produced-character mapping above.
+    if _shift_punctuation_base_map_is_safe():
+        _install_paired(2, _SHIFT_PUNCTUATION_BASE_CP)
 
     # The Esc KEY under Kitty disambiguate mode: ESC[27u (+ modifiers 1-16 incl. super 9+, and
     # lock twins of the modifier-less form, which is how a lone Esc arrives with a lock on).
