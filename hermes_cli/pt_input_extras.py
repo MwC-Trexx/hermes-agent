@@ -18,7 +18,7 @@ def _kitty_reports_unshifted_codepoints() -> bool:
     plus a Shift modifier, while xterm modifyOtherKeys emitters report the
     already-shifted one.  That single difference decides which half of the
     Shift+punctuation table can ever fire, and therefore whether a US-layout
-    assumption is load-bearing — see ``_shift_punctuation_base_map_is_safe``.
+    assumption is load-bearing — see ``_shift_punctuation_base_map``.
 
     Ghostty is excluded deliberately: it is pushed modifyOtherKeys only (its
     kitty disambiguate mode strips Alt from Backspace), so it reports shifted
@@ -60,26 +60,18 @@ def _configured_layout() -> str:
     return layout.split(",")[0].strip()
 
 
-def _us_punctuation_layout() -> bool:
-    """True only when Shift+<punct> is POSITIVELY known to follow US layout.
+def _configured_layout_and_variant() -> tuple[str, str]:
+    """Split the primary layout into ``(layout, variant)``.
 
-    Unknown answers return False, because the caller treats False as "do not
-    guess".
+    xkb spells a variant as ``us(dvorak)``; the variant is the block name inside
+    the layout's symbol file, so keeping it lets the derived map describe the
+    layout the user is actually typing on rather than that file's default.
     """
     primary = _configured_layout()
-    if not primary:
-        return False
-    # Only bare "us" (optionally with a console encoding suffix such as
-    # "us.utf-8") is safe by NAME. "us-" prefixed console keymaps are NOT:
-    # us-acentos turns ' and " into dead accent keys, so Shift+' is not '"'
-    # there. Anything else falls through to the xkb table, which answers from
-    # the layout's actual definition instead of its name.
-    if primary == "us" or primary.startswith("us."):
-        return True
-    # The name is not "us", but the layout may still leave Shift+punctuation
-    # exactly where US puts it — Greek does.  Ask its xkb table rather than
-    # rejecting a layout that is in fact compatible.
-    return _layout_keeps_us_shift_punctuation(primary)
+    if primary.endswith(")") and "(" in primary:
+        layout, _, variant = primary.partition("(")
+        return layout.strip(), variant[:-1].strip()
+    return primary, ""
 
 
 # Shift+<punct> on a US layout, keyed by the base character.  Single source of
@@ -172,6 +164,123 @@ _XKB_SYMBOLS_DIRS = ("/usr/share/X11/xkb/symbols", "/usr/local/share/X11/xkb/sym
 _XKB_KEY_RE = None
 
 
+# X11 keysym names for every printable ASCII character.  Needed to turn an xkb
+# key definition back into the characters it produces, so the Shift+punctuation
+# map can be DERIVED from the user's actual layout instead of assumed from US.
+_KEYSYM_NAMES = (
+    "space exclam quotedbl numbersign dollar percent ampersand apostrophe "
+    "parenleft parenright asterisk plus comma minus period slash "
+    "colon semicolon less equal greater question at "
+    "bracketleft backslash bracketright asciicircum underscore grave "
+    "braceleft bar braceright asciitilde"
+).split()
+_KEYSYM_CHARS = " !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+_XKB_SYM_TO_CHAR = dict(zip(_KEYSYM_NAMES, _KEYSYM_CHARS))
+_XKB_SYM_TO_CHAR.update({c: c for c in "0123456789"})
+_XKB_SYM_TO_CHAR.update({c: c for c in "abcdefghijklmnopqrstuvwxyz"})
+_XKB_SYM_TO_CHAR.update({c: c for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"})
+
+
+def _xkb_symbol_char(name: str) -> str | None:
+    """Resolve one xkb keysym name to its character, or None if not printable.
+
+    Dead keys (``dead_acute``), Greek/Cyrillic letters and anything outside
+    printable ASCII deliberately resolve to None: a key whose shifted value we
+    cannot represent as a character is one we must leave alone.
+    """
+    char = _XKB_SYM_TO_CHAR.get(name)
+    if char is not None:
+        return char
+    if len(name) >= 5 and name[0] == "U":
+        try:
+            code = int(name[1:], 16)
+        except ValueError:
+            return None
+        if 0x20 <= code < 0x7F:
+            return chr(code)
+    return None
+
+
+def _derive_shift_punctuation(layout: str, variant: str = "") -> dict[int, str] | None:
+    """Build ``{base codepoint: shifted char}`` from *layout*'s own xkb table.
+
+    This is what makes the kitty path layout-correct rather than layout-guessed.
+    Kitty reports the UNSHIFTED codepoint, so knowing what a given physical key
+    produces at shift level 2 on THIS layout is exactly the missing information —
+    and xkb already holds it.  On AZERTY ``AE01`` is ``[ampersand, 1]``, so the
+    correct entry is ``ord('&') -> '1'``; on Greek ``AE01`` is ``[1, exclam]``,
+    giving ``ord('1') -> '!'``.  Neither is the US table.
+
+    Only the named variant block is read (``basic`` by default), because later
+    blocks in the same file describe *other* variants and mixing them would
+    invent a layout nobody is using.  Keys whose level-1 or level-2 symbol is
+    not printable ASCII — dead keys, Greek letters — are skipped, so they keep
+    leaking rather than typing something wrong.  Returns None when no xkb data
+    is available at all.
+    """
+    if not layout or "/" in layout or "." in layout or ".." in layout:
+        return None
+    block = _xkb_variant_block(layout, variant or "basic")
+    if block is None:
+        return None
+    _compile_xkb_key_re()
+    wanted = {v: k for k, v in _XKB_KEY_BY_BASE.items()}  # xkb key name -> base char
+    derived: dict[int, str] = {}
+    for match in _XKB_KEY_RE.finditer(block):
+        if match.group("key") not in wanted:
+            continue
+        syms = [s.strip() for s in match.group("syms").split(",")]
+        if len(syms) < 2:
+            continue
+        level1, level2 = syms[0], syms[1]
+        if level1 == "any" or level2 == "any":
+            # Inherits the base (US) layout for this key.
+            us_base = wanted[match.group("key")]
+            derived[ord(us_base)] = _SHIFT_PUNCTUATION_BY_CHAR[us_base]
+            continue
+        base_char = _xkb_symbol_char(level1)
+        shifted_char = _xkb_symbol_char(level2)
+        if base_char is None or shifted_char is None or base_char == shifted_char:
+            continue
+        # Dvorak and friends put LETTERS on punctuation positions, so the scan
+        # picks up pairs like s -> S. Correct, but already covered by the
+        # letter table above and out of place in a punctuation map; skip them
+        # so this map means only what its name says.
+        if base_char.isalpha() and shifted_char.isalpha():
+            continue
+        derived[ord(base_char)] = shifted_char
+    return derived or None
+
+
+def _xkb_variant_block(layout: str, variant: str) -> str | None:
+    """Return the text of ``xkb_symbols "<variant>"`` from *layout*'s file."""
+    for directory in _XKB_SYMBOLS_DIRS:
+        try:
+            with open(
+                f"{directory}/{layout}", encoding="utf-8", errors="replace"
+            ) as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        marker = f'xkb_symbols "{variant}"'
+        start = text.find(marker)
+        if start < 0:
+            return None
+        nxt = text.find("xkb_symbols", start + len(marker))
+        return text[start:] if nxt < 0 else text[start:nxt]
+    return None
+
+
+def _compile_xkb_key_re() -> None:
+    global _XKB_KEY_RE
+    if _XKB_KEY_RE is None:
+        import re
+
+        _XKB_KEY_RE = re.compile(
+            r"key\s*<(?P<key>[A-Z0-9]+)>\s*\{[^}]*?\[(?P<syms>[^\]]*)\]"
+        )
+
+
 def _layout_keeps_us_shift_punctuation(layout: str) -> bool:
     """True when *layout*'s xkb definition leaves Shift+punctuation at US values.
 
@@ -224,26 +333,30 @@ def _layout_keeps_us_shift_punctuation(layout: str) -> bool:
     return False  # no xkb data available
 
 
-def _shift_punctuation_base_map_is_safe() -> bool:
-    """Whether the base-codepoint half of the Shift+punctuation map may install.
+def _shift_punctuation_base_map() -> dict[int, str] | None:
+    """The base-codepoint half of the Shift+punctuation map, or None.
 
-    The map has two halves and they are NOT equally safe:
+    Three cases, in order:
 
-    * ``punct_map[ord(shifted)] = shifted`` is an IDENTITY mapping — whatever
-      shifted codepoint the terminal reports is echoed back.  Correct on every
-      keyboard layout, so it installs unconditionally.
-    * ``punct_map[base_cp] = shifted`` translates ``2`` into ``@`` from a US
-      table.  It is a guess, and on a non-US layout it types the WRONG
-      character rather than leaking an escape sequence.
-
-    Which half fires is decided entirely by the terminal, and only kitty
-    reaches the guessing half — so a kitty user on a Greek/AZERTY/German
-    keyboard is the one who would eat wrong input.  The original Shift+letter
-    patch refused symbols for exactly this reason ("they will leak, but that's
-    better than wrong input"); leaking is still the better failure, so the
-    guess installs only where it cannot be wrong.
+    * **modifyOtherKeys terminals** report the already-shifted codepoint, so
+      this half is never consulted. The US table is harmless there and costs
+      nothing, so install it and keep the behaviour identical to before.
+    * **A literal "us" layout** — the US table is simply correct.
+    * **kitty on anything else** — the terminal reports the UNSHIFTED codepoint,
+      so what Shift produces depends on the layout. Derive it from that
+      layout's own xkb definition; on AZERTY that yields ``&`` -> ``1``, on
+      Greek ``1`` -> ``!``. Keys whose shifted value is a dead key or a
+      non-ASCII letter are omitted and keep leaking, which is the correct
+      failure. If xkb data is unavailable, return None and guess nothing.
     """
-    return not _kitty_reports_unshifted_codepoints() or _us_punctuation_layout()
+    if not _kitty_reports_unshifted_codepoints():
+        return dict(_SHIFT_PUNCTUATION)
+    layout, variant = _configured_layout_and_variant()
+    if not layout:
+        return None
+    if layout == "us" or layout.startswith("us."):
+        return dict(_SHIFT_PUNCTUATION)
+    return _derive_shift_punctuation(layout, variant)
 
 
 _LOCK_BIT_OFFSETS = (0, 64, 128, 192)
@@ -507,12 +620,16 @@ def _modify_other_keys_aliases(ANSI_SEQUENCES: dict, Keys) -> dict[str, object]:
     # sequence. The original Shift+letter patch refused symbols for exactly
     # this reason ("they will leak, but that's better than wrong input"), and
     # leaking is still the better failure — so the guess installs only where it
-    # cannot be wrong. Unknown answers return False, and False means do not
-    # guess. The base half is registered CSI-u ONLY: the tilde spelling of a
-    # base codepoint is not something a layout-resolving emitter sends, and
-    # re-adding it here would shadow the produced-character mapping above.
-    if _shift_punctuation_base_map_is_safe():
-        _install_paired(2, _SHIFT_PUNCTUATION)
+    # cannot be wrong. `_shift_punctuation_base_map()` returns None when the
+    # answer is unknown, and None means do not guess (the keys keep leaking,
+    # which is the correct failure).
+    #
+    # Registered CSI-u ONLY: the tilde spelling of a base codepoint is not
+    # something a layout-resolving emitter sends, and re-adding it here would
+    # shadow the produced-character mapping above.
+    base_punct_map = _shift_punctuation_base_map()
+    if base_punct_map:
+        _install_paired(2, base_punct_map)
 
     # The Esc KEY under Kitty disambiguate mode: ESC[27u (+ modifiers 1-16 incl. super 9+, and
     # lock twins of the modifier-less form, which is how a lone Esc arrives with a lock on).
