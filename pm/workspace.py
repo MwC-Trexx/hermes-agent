@@ -27,12 +27,15 @@ _MEMBER_EXCLUDE = frozenset({
     ".git", ".venv", "venv", "node_modules", "__pycache__",
     ".pytest_cache", ".mypy_cache", ".ruff_cache", ".coverage", ".tox", ".nox",
 })
-_DEFAULT_FILE_EXCLUDES = frozenset({".DS_Store", "Thumbs.db"})
+_DEFAULT_FILE_EXCLUDES = frozenset({".DS_Store", "Thumbs.db", ".localized"})
 _DEFAULT_SUFFIX_EXCLUDES = (
     ".egg-info", ".pyc", ".pyo", ".pyd",
     ".db", ".sqlite", ".sqlite3", ".db-wal", ".db-shm", ".db-journal",
     ".log",
 )
+# AppleDouble sidecars (._code.py) shadow a real file and carry no build input.
+# They ride along whenever a tree is copied to or from a non-APFS volume.
+_DEFAULT_PREFIX_EXCLUDES = ("._",)
 
 
 def _gitignore_pattern_to_regex(pattern: str, anchored: bool) -> re.Pattern:
@@ -183,7 +186,9 @@ def _member_ignored(directory, names):
 
     ignored = set()
     for name in names:
-        if name in _MEMBER_EXCLUDE or name in _DEFAULT_FILE_EXCLUDES or name.endswith(_DEFAULT_SUFFIX_EXCLUDES):
+        if (name in _MEMBER_EXCLUDE or name in _DEFAULT_FILE_EXCLUDES
+                or name.endswith(_DEFAULT_SUFFIX_EXCLUDES)
+                or name.startswith(_DEFAULT_PREFIX_EXCLUDES)):
             is_ignored = True
         else:
             is_ignored = False
