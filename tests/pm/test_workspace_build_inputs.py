@@ -296,3 +296,39 @@ def test_member_stamp_and_workspace_ignore_runtime_and_gitignored_files(tmp_path
     # Changing actual build input MUST change the stamp
     (plugin / "code.py").write_text("def run(): return 42\n", encoding="utf-8")
     assert workspace.members_stamp([plugin]) != baseline_stamp
+
+
+def test_member_stamp_ignores_macos_finder_metadata(tmp_path):
+    """macOS metadata is never a build input, and it lands in ANY member dir.
+
+    Finder writes ``.DS_Store``, AppleDouble ``._*`` sidecars and ``.localized``
+    into directories it indexes, including plugin member folders opened on a
+    non-APFS volume. Hashing them re-stales the recorded venv on every metadata
+    write, and a write landing mid-build aborts the update at the
+    ``install.py`` TOCTOU guard. The JS twin of this is #122636.
+    """
+    plugin = tmp_path / "member"
+    plugin.mkdir()
+    (plugin / "pyproject.toml").write_text(
+        '[project]\nname="member"\nversion="0.1.0"\nrequires-python=">=3.11"\ndependencies=[]\n',
+        encoding="utf-8",
+    )
+    (plugin / "code.py").write_text("def run(): pass\n", encoding="utf-8")
+    nested = plugin / "pkg"
+    nested.mkdir()
+    (nested / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    baseline_stamp = workspace.members_stamp([plugin])
+
+    # Finder metadata, in the member root and in a source subdirectory.
+    (plugin / ".DS_Store").write_bytes(b"\x00\x00\x00\x01Bud1")
+    (plugin / ".localized").write_text("", encoding="utf-8")
+    (plugin / "._code.py").write_bytes(b"\x00\x05\x16\x07")
+    (nested / "._mod.py").write_bytes(b"\x00\x05\x16\x07")
+    (nested / ".DS_Store").write_bytes(b"\x00\x00\x00\x01Bud1")
+
+    assert workspace.members_stamp([plugin]) == baseline_stamp
+
+    # A real source change MUST still move the stamp.
+    (plugin / "code.py").write_text("def run(): return 42\n", encoding="utf-8")
+    assert workspace.members_stamp([plugin]) != baseline_stamp
