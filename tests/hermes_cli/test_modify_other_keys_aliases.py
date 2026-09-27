@@ -246,7 +246,13 @@ def test_kitty_shift_symbol_base_codepoint_is_not_guessed(base_cp, shifted_cp, m
     import hermes_cli.pt_input_extras as ex
 
     # Force the kitty path so the base half is actually consulted rather than
-    # short-circuiting as inert, then make the layout unknowable.
+    # short-circuiting as inert, then make the layout unknowable. Ghostty is
+    # excluded ahead of the KITTY_WINDOW_ID check (see
+    # _kitty_reports_unshifted_codepoints), so a test run from inside an actual
+    # Ghostty session must clear its ambient TERM_PROGRAM/TERM or this always
+    # takes the excluded branch instead of the one under test.
+    monkeypatch.delenv("TERM_PROGRAM", raising=False)
+    monkeypatch.setenv("TERM", "xterm-kitty")
     monkeypatch.setenv("KITTY_WINDOW_ID", "1")
     monkeypatch.setattr(ex, "_configured_layout_and_variant", lambda: ("", ""))
     assert ex._shift_punctuation_base_map() is None
