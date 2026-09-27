@@ -611,25 +611,36 @@ def _modify_other_keys_aliases(ANSI_SEQUENCES: dict, Keys) -> dict[str, object]:
         for modifier in (2, 9, 10):
             _put(f"\x1b[27;{modifier};{cp}~", chr(cp))
 
-    # -- Shift+punctuation, base-codepoint half (the only half the loop above
-    # does not already cover). The tilde form maps the PRODUCED character, so
-    # it is layout-safe by construction. Kitty's CSI-u form instead reports the
-    # UNSHIFTED codepoint, so kitty is the only terminal that can reach a
-    # base->shifted translation, and that translation is a guess: on a non-US
-    # layout it types the WRONG character rather than leaking an escape
-    # sequence. The original Shift+letter patch refused symbols for exactly
-    # this reason ("they will leak, but that's better than wrong input"), and
-    # leaking is still the better failure — so the guess installs only where it
-    # cannot be wrong. `_shift_punctuation_base_map()` returns None when the
-    # answer is unknown, and None means do not guess (the keys keep leaking,
-    # which is the correct failure).
+    # -- Shift+punctuation over CSI-u (the spelling kitty uses). The tilde
+    # form above already maps the PRODUCED character and is therefore
+    # layout-safe by construction, so only CSI-u needs the work here, and it is
+    # registered CSI-u ONLY — re-registering the tilde spelling would shadow
+    # the produced-character mapping with a worse one.
     #
-    # Registered CSI-u ONLY: the tilde spelling of a base codepoint is not
-    # something a layout-resolving emitter sends, and re-adding it here would
-    # shadow the produced-character mapping above.
+    # The map has two halves and they are NOT equally safe:
+    #
+    # * identity, ``punct_map[ord(shifted)] = shifted`` — echoes back whatever
+    #   shifted codepoint the terminal reported. Correct on every keyboard
+    #   layout, so it always installs.
+    # * base, ``punct_map[base_cp] = shifted`` — translates the UNSHIFTED
+    #   codepoint kitty reports through a layout table. It is a guess, and on a
+    #   layout it does not match it types the WRONG character rather than
+    #   leaking an escape sequence. The original Shift+letter patch refused
+    #   symbols for exactly this reason ("they will leak, but that's better
+    #   than wrong input"), and leaking is still the better failure — so this
+    #   half installs only where it cannot be wrong. `_shift_punctuation_base_map`
+    #   returns None when the answer is unknown, and None means do not guess
+    #   (those keys keep leaking, which is the correct failure).
+    def _install_paired_csi_u(mapping: dict[int, str]) -> None:
+        """CSI-u only (plus lock twins) — kitty ORs lock bits into the modifier."""
+        for codepoint, key_val in mapping.items():
+            for mod in _lock_variants(2):
+                _put(f"\x1b[{codepoint};{mod}u", key_val)
+
+    _install_paired_csi_u({ord(s): s for s in _SHIFT_PUNCTUATION_BY_CHAR.values()})
     base_punct_map = _shift_punctuation_base_map()
     if base_punct_map:
-        _install_paired(2, base_punct_map)
+        _install_paired_csi_u(base_punct_map)
 
     # The Esc KEY under Kitty disambiguate mode: ESC[27u (+ modifiers 1-16 incl. super 9+, and
     # lock twins of the modifier-less form, which is how a lone Esc arrives with a lock on).
