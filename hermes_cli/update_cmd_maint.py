@@ -462,11 +462,13 @@ def _verify_and_restore_one_state_db(home: Path, *, label: str) -> None:
         if not state_path.exists():
             return
         ok = verify_sqlite_integrity(state_path, check_header=True, run_pragma=True)
-        # `valid` is tri-state: None means no check reached a verdict (a live connection made
-        # the byte probe unavailable and nothing deeper could judge), which is not a corruption
-        # verdict. Only a definite False may accuse the database.
-        if ok.get("valid") is not False:
-            logger.debug("Post-update state.db integrity not a failure (%s): %s", label, ok.get("message"))
+        # An unavailable check is not evidence of corruption. In particular, a concurrent
+        # SQLite holder can make the read-only probe return BUSY/LOCKED.
+        if ok.get("valid") is None:
+            print(f"  ⚠ state.db verification deferred ({label}): {ok.get('message', 'unknown error')}")
+            return
+        if ok.get("valid") is True:
+            logger.debug("Post-update state.db integrity OK (%s): %s", label, ok.get("message"))
             return
         print()
         print(f"⚠ state.db is corrupted after update ({label}): " + ok.get("message", "unknown error"))

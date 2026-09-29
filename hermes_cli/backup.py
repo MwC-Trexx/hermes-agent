@@ -412,8 +412,8 @@ def verify_sqlite_integrity(
     in this process makes the byte-level header probe unavailable, which costs the header
     answer only — the size ceiling and ``PRAGMA`` below open their own read-only connection
     and still reach a verdict, so they keep running. ``None`` is returned only when the
-    header probe was skipped AND nothing deeper was asked for, i.e. there was no check left
-    to run rather than a check that came back bad.
+    header probe was skipped AND nothing deeper was asked for, or when a deeper SQLite query
+    could not run because the database was busy or locked.
     """
     # Set only when a live connection made the byte probe unavailable. Losing the byte probe
     # is not a verdict: the checks below open their own read-only connection and are unaffected,
@@ -428,6 +428,14 @@ def verify_sqlite_integrity(
         if header_note and header_note not in message:
             message = f"{message} ({header_note})"
         return {"valid": valid, "message": message, "size": size}
+
+    def _query_failure(message: str, exc: Exception, size: int) -> dict:
+        # Extended SQLite result codes retain the primary code in the low byte.
+        # Contention prevents a verdict; it does not establish corruption.
+        code = getattr(exc, "sqlite_errorcode", None)
+        if isinstance(code, int) and (code & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+            return _done(message, valid=None, size=size)
+        return _done(message, size=size)
     try:
         st = path.stat()
     except FileNotFoundError:
@@ -461,7 +469,7 @@ def verify_sqlite_integrity(
             c.execute("SELECT count(*) FROM sqlite_master").fetchone()))
         if exc is not None:
             kind = "failed" if isinstance(exc, sqlite3.DatabaseError) else "error"
-            return _done(f"schema probe {kind}: {exc}", size=size)
+            return _query_failure(f"schema probe {kind}: {exc}", exc, size)
         # Name only the checks that actually ran. Behind a live connection the byte probe
         # never executed, so crediting it here would assert evidence this call never gathered
         # (and would contradict the skipped-probe note _done appends to the same line).
@@ -477,7 +485,7 @@ def verify_sqlite_integrity(
             path, lambda c: [str(r[0]) for r in c.execute("PRAGMA integrity_check")])
         if exc is not None:
             kind = "cannot open database" if isinstance(exc, sqlite3.DatabaseError) else "integrity check error"
-            return _done(f"{kind}: {exc}", size=size)
+            return _query_failure(f"{kind}: {exc}", exc, size)
         if rows == ["ok"]:
             return _done("integrity check passed", valid=True, size=size)
         return _done(f"integrity check failed: {'; '.join(rows[:5])}", size=size)
