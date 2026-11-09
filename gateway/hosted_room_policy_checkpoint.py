@@ -113,6 +113,29 @@ def _settled_message(
     return event
 
 
+def _drop_orphaned_settlements(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop settled receipts whose anchor or committed message aged out of the bounded window.
+
+    Transcript compaction keeps the newest ``MAX_THREAD_TRANSCRIPT_EVENTS`` thread messages; a
+    ``turn.settled`` published around the cutoff survives while its ``message.user`` anchor (or
+    its committed member message) is deleted, and watermark validation then rejects the snapshot
+    forever — prepare fails on every pass and the room can never wake a member again. The
+    receipt's watermark effect is already durable in ``hosted_room_policy_watermarks``, so a
+    settlement with no anchor in the window carries no planning value. Other receipt kinds pass:
+    only a failed-passthrough settlement is validated against its anchor.
+    """
+    present = {event["event_id"] for event in events if event["kind"] in {"message.user", "message.member"}}
+
+    def orphaned(event: dict[str, Any]) -> bool:
+        if event["kind"] != "turn.settled" or event["payload"].get("passed") is not False:
+            return False
+        payload = event["payload"]
+        return (payload.get("discussion_event_id") not in present
+                or payload.get("message_event_id") not in present)
+
+    return [event for event in events if not orphaned(event)]
+
+
 class HostedRoomPolicyCheckpoint:
     """Incrementally index room policy without compacting visible history."""
     def __init__(self, db_path: DbPath, *, max_active_events: int = MAX_ACTIVE_POLICY_EVENTS) -> None:
@@ -193,7 +216,7 @@ class HostedRoomPolicyCheckpoint:
         events_by_seq = {
             int(event["seq"]): event
             for event in (*map(_event_from_room_row, rows), *(json.loads(row["event_json"]) for row in active_rows))}
-        return [events_by_seq[seq] for seq in sorted(events_by_seq)]
+        return _drop_orphaned_settlements([events_by_seq[seq] for seq in sorted(events_by_seq)])
 
     # -- per-kind projection handlers (dispatched by _apply_event) -----------
 
